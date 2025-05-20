@@ -1,16 +1,27 @@
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from fastapi import FastAPI
 
 import os
-import redis
-import sys
-import pathlib
+import redis.asyncio as redis
 
-# 현재 디렉토리의 부모 디렉토리를 Python 경로에 추가
-sys.path.append(str(pathlib.Path(__file__).parent.parent.resolve()))
 
 # 환경변수 로드
 load_dotenv()
+
+# Redis 클라이언트 전역 변수 선언
+redis_client = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.redis_client = redis.Redis(
+        host=os.getenv('REDIS_HOST'),
+        port=os.getenv('REDIS_PORT'),
+        db=os.getenv('REDIS_DB'),
+        decode_responses=True,
+    )
+    yield
+    await app.state.redis_client.aclose()
 
 # FastAPI 애플리케이션 초기화
 app = FastAPI(
@@ -21,31 +32,14 @@ app = FastAPI(
         "syntaxHighlight": {
             "theme": "obsidian"
         }
-    }
-)
-
-# Redis 연결 설정
-redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST'),
-    port=os.getenv('REDIS_PORT'),
-    db=os.getenv('REDIS_DB'),
-    decode_responses=True,
+    },
+    lifespan=lifespan,
 )
 
 # 라우터 등록
 from routers.router import router
 app.include_router(router, prefix="/api", tags=["LLM Background"])
 
-# 애플리케이션 시작 시 실행될 이벤트
-@app.on_event("startup")
-async def startup_event():
-    print("Application startup")
-
-# 애플리케이션 종료 시 실행될 이벤트
-@app.on_event("shutdown")
-async def shutdown_event():
-    print("Application shutdown")
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="localhost", port=8000)
+    uvicorn.run("app.main:app", host="localhost", port=8000)
