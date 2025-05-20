@@ -22,7 +22,6 @@ wheels/
 
 # Environment
 .env
-.env.*
 venv/
 virtualenv/
 __pypackages__/
