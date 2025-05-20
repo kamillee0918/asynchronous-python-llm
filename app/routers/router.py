@@ -8,7 +8,12 @@ import uuid
 import os
 import asyncio
 import redis.asyncio as redis
+import logging
 
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO) # INFO 레벨 설정
+logger = logging.getLogger(__name__)
 
 # 환경변수 호출
 load_dotenv()
@@ -39,20 +44,22 @@ async def background_worker():
     while True:
         try:
             task_id, prompt = await task_queue.get()
-            # INFO: 직접 비동기 함수 호출로 변경
             await process_llm_task(task_id, prompt)
             task_queue.task_done()
-        except Exception as e:
-            print(f"Background worker error: {e}")
+        except Exception as error:
+            print(f"Background worker error: {error}")
             continue
 
 
 async def process_llm_task(task_id: str, prompt: str):
-    """LLM 작업 처리 함수"""
+    """LLM 작업 처리 함수
+    
+    Args:
+        task_id (str): 작업 ID
+        prompt (str): 프롬프트
+    """
     try:
-        client = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-
-        # Redis 상태 업데이트
+        # Redis 상태를 "processing"으로 업데이트
         await redis_client.hset(
             f"task:{task_id}",
             mapping={
@@ -61,53 +68,74 @@ async def process_llm_task(task_id: str, prompt: str):
             }
         )
 
-        await redis_client.hset(
-            f"task:{task_id}", "progress", "25"
-        )
-
-        # OpenAI가 지원하는 모델 호출
-        response = await client.responses.create(
-            model="gpt-3.5-turbo",
-            input=prompt,
-            max_output_tokens=100, # 최대 출력 토큰 수
-            temperature=0.7
-        )
-        # print("# response:", response)
-
-        await redis_client.hset(
-            f"task:{task_id}", "progress", "75"
-        )
-
-        # Redis 완료 상태 업데이트
-        await redis_client.hset(
-            f"task:{task_id}",
-            mapping={
-                "status": "completed",
-                "result": response.output_text,
-                "progress": "100"
-            }
-        )
-
-        # 24시간이 지나면 만료(키 삭제)
+        # 24시간 TTL 설정(만료 시, 키 삭제)
         await redis_client.expire(
             f"task:{task_id}",
             86400
         )
-    
-    except Exception as e:
-        # Redis 오류 상태 업데이트
+
+        # OpenAI API 호출
+        client = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        try:
+            # OpenAI가 지원하는 모델 호출
+            response = await client.responses.create(
+                model="gpt-3.5-turbo",
+                input=prompt,
+                max_output_tokens=100, # 최대 출력 토큰 수
+                temperature=0.7
+            )
+
+            result = response.output_text
+        
+            # 작업 결과 및 상태 업데이트
+            await redis_client.hset(
+                f"task:{task_id}",
+                mapping={
+                    "status": "completed",
+                    "result": result,
+                    "progress": "100"
+                }
+            )
+        except TimeoutError:
+            # 타임아웃 처리
+            await redis_client.hset(
+                f"task:{task_id}",
+                mapping={
+                    "status": "error",
+                    "error": "Request timed out"
+                }
+            )
+        except Exception as error:
+            # OpenAI API 오류 처리
+            await redis_client.hset(
+                f"task:{task_id}",
+                mapping={
+                    "status": "error",
+                    "error": str(error)
+                }
+            )
+    except Exception as error:
+        # 예상치 못한 오류 처리
         await redis_client.hset(
             f"task:{task_id}",
             mapping={
-                "status": "failed",
-                "error": str(e)
+                "status": "unexpected_error",
+                "error": str(error)
             }
         )
 
 
 @router.post("/tasks")
 async def create_tasks(prompts: PromptList):
-    """프롬프트 리스트를 큐에 추가하고 작업 ID를 반환하는 함수"""
+    """프롬프트 리스트를 큐에 추가하고 작업 ID를 반환하는 함수
+    
+    Args:
+        prompts (PromptList): 프롬프트 리스트
+    
+    Returns:
+        dict: 작업 ID 리스트와 상태
+    """
     task_ids = []
     
     # INFO: 라우터 초기화 시 워커 생성 로직으로 변경
@@ -128,7 +156,15 @@ async def create_tasks(prompts: PromptList):
 
 @router.get("/tasks")
 async def get_task_status(task_ids: str, request: Request):
-    """작업 상태를 반환하는 함수"""
+    """작업 상태를 반환하는 함수
+    
+    Args:
+        task_ids (str): 쉼표로 구분된 작업 ID 리스트
+        request (Request): FastAPI Request 객체
+    
+    Returns:
+        dict: 작업 ID별 상태 정보
+    """
     # 쉼표로 구분된 작업 ID 리스트를 분리
     task_id_list = task_ids.split(",")
     res = {}
